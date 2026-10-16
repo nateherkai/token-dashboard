@@ -20,15 +20,10 @@ function writeRange(key) {
   location.hash = '#' + base + '?range=' + encodeURIComponent(key);
 }
 
-function sinceIso(range) {
-  if (!range.days) return null;
-  return new Date(Date.now() - range.days * 86400 * 1000).toISOString();
-}
-
 export default async function (root) {
   const range = readRange();
-  const since = sinceIso(range);
-  const url = '/api/skills' + (since ? '?since=' + encodeURIComponent(since) : '');
+  const days = range.days;
+  const url = '/api/skills' + (days ? '?days=' + days : '');
   const skills = await api(url);
 
   const totalInvocations = skills.reduce((s, r) => s + r.invocations, 0);

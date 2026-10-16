@@ -1,3 +1,5 @@
+import { formatTimestamp } from '/web/dates.js';
+
 // app.js — router, state, fetch helpers
 
 export const $  = (sel, root=document) => root.querySelector(sel);
@@ -20,7 +22,8 @@ export const fmt = {
     return '';
   },
   modelShort: m => (m || '').replace('claude-', ''),
-  ts: t => (t || '').slice(0, 16).replace('T', ' '),
+  ts: t => formatTimestamp(t, state.timezone),
+  time: t => formatTimestamp(t, state.timezone, true),
 };
 
 export async function api(path, opts) {
@@ -29,7 +32,8 @@ export async function api(path, opts) {
   return r.json();
 }
 
-export const state = { plan: 'api', pricing: null };
+export const state = { plan: 'api', pricing: null, timezone: 'UTC' };
+
 
 const ROUTES = {
   '/overview': () => import('/web/routes/overview.js'),
@@ -50,6 +54,7 @@ function buildTopbar() {
       ${Object.keys(ROUTES).map(p => `<a href="#${p}" data-route="${p}">${p.slice(1)}</a>`).join('')}
     </nav>
     <div class="spacer"></div>
+    <span class="pill" id="timezone-pill">UTC</span>
     <span class="pill" id="plan-pill">api</span>
     <span class="pill muted" title="Cmd/Ctrl+B blurs sensitive text">⌘B blur</span>
   `;
@@ -106,7 +111,13 @@ async function firstRun() {
 
 async function boot() {
   buildTopbar();
-  const planResp = await api('/api/plan');
+  const [planResp, settings] = await Promise.all([api('/api/plan'), api('/api/settings')]);
+  const browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  state.timezone = settings.timezone || (settings.timezones.includes(browserZone) ? browserZone : 'UTC');
+  if (!settings.timezone && settings.timezones.includes(browserZone)) {
+    await api('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ timezone: state.timezone }) });
+  }
+  $('#timezone-pill').textContent = state.timezone;
   state.plan = planResp.plan;
   state.pricing = planResp.pricing;
   $('#plan-pill').textContent = state.plan;

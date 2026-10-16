@@ -10,10 +10,12 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
+from .dates import day_range, timezone_names
+
 from .db import (
     overview_totals, expensive_prompts, project_summary,
     tool_token_breakdown, recent_sessions, session_turns,
-    daily_token_breakdown, model_breakdown, skill_breakdown,
+    daily_token_breakdown, model_breakdown, skill_breakdown, get_timezone, set_timezone,
 )
 from .pricing import load_pricing, cost_for, get_plan, set_plan
 from .tips import all_tips, dismiss_tip
@@ -84,6 +86,14 @@ def build_handler(db_path: str, projects_dir: str):
             path = url.path
             since = qs.get("since", [None])[0]
             until = qs.get("until", [None])[0]
+            if "days" in qs:
+                try:
+                    days = int(qs["days"][0])
+                    if not 1 <= days <= 3660:
+                        raise ValueError()
+                    since, until = day_range(days, get_timezone(db_path) or "UTC")
+                except ValueError:
+                    return _send_error(self, 400, "days must be an integer from 1 to 3660")
             if path in ("/", "/index.html"):
                 return _serve_static(self, "index.html")
             if path.startswith("/web/"):
@@ -139,6 +149,11 @@ def build_handler(db_path: str, projects_dir: str):
                 return _send_json(self, session_turns(db_path, sid))
             if path == "/api/tips":
                 return _send_json(self, all_tips(db_path))
+            if path == "/api/settings":
+                return _send_json(self, {
+                    "timezone": get_timezone(db_path),
+                    "timezones": sorted(timezone_names()),
+                })
             if path == "/api/plan":
                 return _send_json(self, {"plan": get_plan(db_path), "pricing": pricing})
             if path == "/api/scan":
@@ -178,6 +193,12 @@ def build_handler(db_path: str, projects_dir: str):
                 return _send_error(self, 400, "invalid JSON")
             if not isinstance(body, dict):
                 return _send_error(self, 400, "body must be a JSON object")
+            if url.path == "/api/settings":
+                try:
+                    set_timezone(db_path, body.get("timezone"))
+                except ValueError as exc:
+                    return _send_error(self, 400, str(exc))
+                return _send_json(self, {"ok": True, "timezone": get_timezone(db_path)})
             if url.path == "/api/plan":
                 set_plan(db_path, body.get("plan", "api"))
                 return _send_json(self, {"ok": True})

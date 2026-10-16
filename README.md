@@ -18,11 +18,11 @@ A local dashboard that reads the JSONL transcripts Claude Code writes to `~/.cla
 
 ## Prerequisites
 
-- **Python 3.8 or newer** — already installed on macOS and most Linux. On Windows: `winget install Python.Python.3.12` or download from python.org.
+- **Python 3.9 or newer** — already installed on macOS and most Linux. On Windows: `winget install Python.Python.3.12` or download from python.org.
 - **Claude Code** — installed and with at least one session run. The dashboard reads those sessions. If you just installed Claude Code and haven't used it yet, run at least one prompt first.
 - **A web browser.** Any modern one.
 
-No `pip install`. No Node.js. No build step.
+No Node.js or build step. Python uses the standard library; timezone selection also needs IANA timezone data (normally supplied by macOS and Linux, see below).
 
 ## Quickstart
 
@@ -69,6 +69,18 @@ python3 cli.py dashboard --projects-dir /path/to/projects --db /path/to/cache.db
 
 Pricing lives in [`pricing.json`](pricing.json). Edit it directly if model prices change or to add a new plan.
 
+## Timezone
+
+Settings defaults to your browser timezone on the first visit and saves it in the local database. The selected zone applies to displayed timestamps, calendar-day ranges, daily charts, and CLI `today`. Stored transcript timestamps stay unchanged.
+
+Python 3.9+ reads IANA timezone data from the operating system. macOS and Linux normally provide it. On Windows, or a minimal system without that database, install the optional data package:
+
+```bash
+py -3 -m pip install tzdata
+```
+
+Use `python3 -m pip install tzdata` on other systems without timezone data. Restart the dashboard afterward. Until data is available, the dashboard offers UTC and shows a notice in Settings; it does not save that fallback as your browser preference.
+
 ## CLI reference
 
 ```bash
@@ -95,7 +107,7 @@ The dashboard is a single page with a hash-router tab bar across the top. Each t
 - **Projects** — per-project comparison: tokens, session counts, and which files were touched most.
 - **Skills** — which skills you invoke most often, and (where we can measure them) their token cost. See [limitations](docs/KNOWN_LIMITATIONS.md#skills-token-counts-are-partial).
 - **Tips** — rule-based suggestions for reducing token usage (repeated file reads, oversized tool results, low cache-hit rate, etc.).
-- **Settings** — switch pricing between API / Pro / Max / Max-20x so cost figures everywhere else reflect your actual plan.
+- **Settings** — choose your pricing plan and timezone. Timestamps, daily chart buckets, and calendar-day filters use the selected IANA timezone, including daylight saving time. The first browser visit saves your browser timezone; the CLI `today` command uses the same saved setting (UTC until a timezone is saved). Changing timezone does not require a rescan.
 
 The Overview tab also has a built-in "What do these numbers mean?" panel that explains input/output/cache tokens in plain English.
 

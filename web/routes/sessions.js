@@ -72,7 +72,7 @@ async function renderSession(root, id) {
               : tools.length ? tools.map(x => x.name).join(' · ')
               : '';
             return `<tr>
-              <td class="mono">${(t.timestamp || '').slice(11,19)}</td>
+              <td class="mono">${fmt.time(t.timestamp)}</td>
               <td>${t.type}${t.is_sidechain ? ' <span class="badge">side</span>' : ''}</td>
               <td>${t.model ? `<span class="badge ${fmt.modelClass(t.model)}">${fmt.htmlSafe(fmt.modelShort(t.model))}</span>` : ''}</td>
               <td class="blur-sensitive">${fmt.htmlSafe(summary)}</td>

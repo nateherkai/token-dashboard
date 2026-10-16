@@ -1,7 +1,10 @@
-import { api, state, $ } from '/web/app.js';
+import { api, fmt, state, $ } from '/web/app.js';
 
 export default async function (root) {
-  const cur = await api('/api/plan');
+  const [cur, settings] = await Promise.all([api('/api/plan'), api('/api/settings')]);
+  const zones = settings.timezones.filter(zone => {
+    try { new Intl.DateTimeFormat('en', { timeZone: zone }); return true; } catch { return false; }
+  });
   const plans = Object.entries(cur.pricing.plans);
   root.innerHTML = `
     <div class="card">
@@ -14,6 +17,20 @@ export default async function (root) {
         </select>
         <button class="primary" id="save">Save</button>
         <span id="msg" class="muted"></span>
+      </div>
+
+      <hr class="divider">
+
+      <h3>Timezone</h3>
+      <p class="muted" style="margin:0 0 12px">Timestamps, daily charts, and date ranges use this timezone, including daylight saving time. Defaults to your browser timezone.</p>
+      ${zones.length === 1 ? '<p class="muted">Only UTC is available on this server. Install IANA timezone data to enable other zones; see the README Timezone section.</p>' : ''}
+      <div class="flex">
+        <label for="timezone">Timezone</label>
+        <select id="timezone">
+          ${zones.map(zone => `<option value="${fmt.htmlSafe(zone)}" ${zone === state.timezone ? 'selected' : ''}>${fmt.htmlSafe(zone)}</option>`).join('')}
+        </select>
+        <button class="primary" id="save-timezone">Save timezone</button>
+        <span id="timezone-msg" class="muted" role="status"></span>
       </div>
 
       <hr class="divider">
@@ -40,6 +57,22 @@ export default async function (root) {
       <h3>Privacy</h3>
       <p class="muted">Press <code>Cmd/Ctrl + B</code> anywhere to blur prompt text and other sensitive content for screenshots.</p>
     </div>`;
+
+  $('#save-timezone').addEventListener('click', async () => {
+    const button = $('#save-timezone');
+    button.disabled = true;
+    try {
+      const timezone = $('#timezone').value;
+      await api('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ timezone }) });
+      state.timezone = timezone;
+      $('#timezone-pill').textContent = timezone;
+      $('#timezone-msg').textContent = 'Saved.';
+    } catch (error) {
+      $('#timezone-msg').textContent = `Could not save timezone: ${error.message}`;
+    } finally {
+      button.disabled = false;
+    }
+  });
 
   $('#save').addEventListener('click', async () => {
     const plan = $('#plan').value;

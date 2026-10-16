@@ -8,6 +8,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Union
 
+from .dates import local_day, zone_for
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
   path        TEXT PRIMARY KEY,
@@ -119,6 +121,19 @@ def connect(path: Union[str, Path]):
         yield conn
     finally:
         conn.close()
+
+
+def get_timezone(db_path):
+    with connect(db_path) as c:
+        row = c.execute("SELECT v FROM plan WHERE k='timezone'").fetchone()
+    return row["v"] if row else None
+
+
+def set_timezone(db_path, name):
+    zone_for(name)
+    with connect(db_path) as c:
+        c.execute("INSERT OR REPLACE INTO plan (k, v) VALUES ('timezone', ?)", (name,))
+        c.commit()
 
 
 def _range_clause(since, until, col: str = "timestamp"):
@@ -315,18 +330,20 @@ def daily_token_breakdown(db_path, since=None, until=None) -> list:
     """One row per day: stacked bar data for input/output/cache_read/cache_create."""
     rng, args = _range_clause(since, until)
     sql = f"""
-      SELECT substr(timestamp, 1, 10) AS day,
+      SELECT local_day(timestamp) AS day,
              COALESCE(SUM(input_tokens),0)      AS input_tokens,
              COALESCE(SUM(output_tokens),0)     AS output_tokens,
              COALESCE(SUM(cache_read_tokens),0) AS cache_read_tokens,
              COALESCE(SUM(cache_create_5m_tokens),0)
                + COALESCE(SUM(cache_create_1h_tokens),0) AS cache_create_tokens
         FROM messages
-       WHERE timestamp IS NOT NULL {rng}
+       WHERE timestamp IS NOT NULL AND local_day(timestamp) IS NOT NULL {rng}
        GROUP BY day
        ORDER BY day ASC
     """
+    zone = zone_for(get_timezone(db_path) or "UTC")
     with connect(db_path) as c:
+        c.create_function("local_day", 1, lambda ts: local_day(ts, zone), deterministic=True)
         return [dict(r) for r in c.execute(sql, args)]
 
 

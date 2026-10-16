@@ -63,6 +63,35 @@ class ServerTests(unittest.TestCase):
         self.assertIn("plan", body)
         self.assertIn("pricing", body)
 
+    def test_timezone_setting_changes_daily_grouping(self):
+        settings = json.loads(self._get('/api/settings'))
+        self.assertIn('America/Los_Angeles', settings['timezones'])
+        req = urllib.request.Request(
+            f'http://127.0.0.1:{self.port}/api/settings',
+            data=json.dumps({'timezone': 'America/Los_Angeles'}).encode(),
+            headers={'Content-Type': 'application/json'},
+        )
+        with urllib.request.urlopen(req) as response:
+            self.assertTrue(json.load(response)['ok'])
+        self.assertEqual(json.loads(self._get('/api/settings'))['timezone'], 'America/Los_Angeles')
+        self.assertEqual(json.loads(self._get('/api/daily'))[0]['day'], '2026-04-18')
+
+    def test_invalid_timezone_and_day_ranges_return_400(self):
+        from urllib.error import HTTPError
+        for value in ['Invalid/Zone', None, 123]:
+            req = urllib.request.Request(
+                f'http://127.0.0.1:{self.port}/api/settings',
+                data=json.dumps({'timezone': value}).encode(),
+                headers={'Content-Type': 'application/json'},
+            )
+            with self.assertRaises(HTTPError) as error:
+                urllib.request.urlopen(req)
+            self.assertEqual(error.exception.code, 400)
+        for value in ['0', '-1', 'garbage', '3661']:
+            with self.assertRaises(HTTPError) as error:
+                self._get('/api/daily?days=' + value)
+            self.assertEqual(error.exception.code, 400)
+
     def test_head_returns_200_not_501(self):
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}/", method="HEAD")
         with urllib.request.urlopen(req) as resp:

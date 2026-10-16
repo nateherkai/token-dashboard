@@ -4,10 +4,10 @@ from __future__ import annotations
 import argparse
 import os
 import webbrowser
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from token_dashboard.db import init_db, default_db_path, overview_totals
+from token_dashboard.db import init_db, default_db_path, overview_totals, get_timezone
+from token_dashboard.dates import day_range
 from token_dashboard.scanner import scan_dir
 from token_dashboard.tips import all_tips
 
@@ -24,11 +24,8 @@ def _projects(args) -> str:
     )
 
 
-def _today_range():
-    now = datetime.now(timezone.utc)
-    start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc).isoformat()
-    end = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    return start, end
+def _today_range(timezone_name="UTC"):
+    return day_range(1, timezone_name)
 
 
 def cmd_scan(args):
@@ -41,7 +38,7 @@ def cmd_scan(args):
 def cmd_today(args):
     db = _db_path(args)
     init_db(db)
-    s, e = _today_range()
+    s, e = _today_range(get_timezone(db) or "UTC")
     t = overview_totals(db, since=s, until=e)
     print("Token Dashboard — today")
     print(f"  sessions: {t['sessions']}    turns: {t['turns']}")

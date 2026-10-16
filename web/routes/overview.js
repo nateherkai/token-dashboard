@@ -20,27 +20,22 @@ function writeRange(key) {
   location.hash = '#' + base + '?range=' + encodeURIComponent(key);
 }
 
-function sinceIso(range) {
-  if (!range.days) return null;
-  return new Date(Date.now() - range.days * 86400 * 1000).toISOString();
-}
-
-function withSince(url, since) {
-  if (!since) return url;
-  return url + (url.includes('?') ? '&' : '?') + 'since=' + encodeURIComponent(since);
+function withDays(url, days) {
+  if (!days) return url;
+  return url + (url.includes('?') ? '&' : '?') + 'days=' + days;
 }
 
 export default async function (root) {
   const range = readRange();
-  const since = sinceIso(range);
+  const days = range.days;
 
   const [totals, projects, sessions, tools, daily, byModel] = await Promise.all([
-    api(withSince('/api/overview', since)),
-    api(withSince('/api/projects', since)),
-    api(withSince('/api/sessions?limit=10', since)),
-    api(withSince('/api/tools', since)),
-    api(withSince('/api/daily', since)),
-    api(withSince('/api/by-model', since)),
+    api(withDays('/api/overview', days)),
+    api(withDays('/api/projects', days)),
+    api(withDays('/api/sessions?limit=10', days)),
+    api(withDays('/api/tools', days)),
+    api(withDays('/api/daily', days)),
+    api(withDays('/api/by-model', days)),
   ]);
 
   const cacheCreate =
