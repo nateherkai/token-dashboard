@@ -16,8 +16,10 @@ in front of the dashboard if you expose it beyond localhost.
 
 Cookie shape:
   td_session=<base64(payload)>.<hex(hmac_sha256(secret, payload))>
-where payload is `<username>|<expiry_unix_seconds>`. Expiry default 14
-days. Tampering changes the HMAC; expiry past wall-clock invalidates.
+where payload is `<username>|<expiry_unix_seconds>` for legacy sessions or
+`<username>|<expiry_unix_seconds>|<random_csrf_nonce>` for new sessions.
+Expiry default 14 days. Tampering changes the HMAC; expiry past wall-clock
+invalidates.
 """
 from __future__ import annotations
 
@@ -25,12 +27,23 @@ import base64
 import hashlib
 import hmac
 import os
+import secrets
 import time
-from typing import Optional
+from typing import Optional, Union
 
 
 COOKIE_NAME = "td_session"
+LOGIN_CSRF_COOKIE_NAME = "td_login_csrf"
+CSRF_HEADER = "X-TD-CSRF"
 COOKIE_MAX_AGE = 14 * 24 * 3600  # 14 days
+LOGIN_CSRF_MAX_AGE = 10 * 60
+
+
+def _constant_time_equal(left: object, right: object) -> bool:
+    try:
+        return hmac.compare_digest(left, right)
+    except (TypeError, ValueError):
+        return False
 
 
 def _user() -> Optional[str]:
@@ -58,7 +71,7 @@ def _sign(payload: str) -> str:
 def make_cookie(username: str) -> str:
     """Build a signed cookie value good for COOKIE_MAX_AGE seconds."""
     expiry = int(time.time()) + COOKIE_MAX_AGE
-    payload = f"{username}|{expiry}"
+    payload = f"{username}|{expiry}|{secrets.token_urlsafe(32)}"
     sig = _sign(payload)
     encoded = base64.urlsafe_b64encode(payload.encode()).decode()
     return f"{encoded}.{sig}"
@@ -75,11 +88,12 @@ def verify_cookie(cookie_value: Optional[str]) -> Optional[str]:
         return None
     expected_sig = _sign(payload)
     # Constant-time compare to avoid timing leaks
-    if not hmac.compare_digest(sig, expected_sig):
+    if not _constant_time_equal(sig, expected_sig):
         return None
-    if "|" not in payload:
+    if payload.count("|") not in (1, 2):
         return None
-    username, expiry_str = payload.rsplit("|", 1)
+    fields = payload.split("|")
+    username, expiry_str = fields[:2]
     try:
         if int(expiry_str) < int(time.time()):
             return None
@@ -90,15 +104,99 @@ def verify_cookie(cookie_value: Optional[str]) -> Optional[str]:
     return username
 
 
+def csrf_token(cookie_value: Optional[str]) -> Optional[str]:
+    if not cookie_value or "." not in cookie_value:
+        return None
+    try:
+        encoded, sig = cookie_value.rsplit(".", 1)
+        payload = base64.urlsafe_b64decode(encoded.encode()).decode()
+    except Exception:
+        return None
+    if not _constant_time_equal(sig, _sign(payload)) or payload.count("|") not in (1, 2):
+        return None
+    fields = payload.split("|")
+    username, expiry_str = fields[:2]
+    try:
+        if int(expiry_str) < int(time.time()):
+            return None
+    except ValueError:
+        return None
+    if username != _user():
+        return None
+    if len(fields) == 2:
+        return _sign(f"td-session-csrf-v1\x00{cookie_value}")
+    return fields[2] or None
+
+
+def verify_csrf(cookie_value: Optional[str], submitted: Optional[str]) -> bool:
+    token = csrf_token(cookie_value)
+    return bool(token and submitted and _constant_time_equal(token, submitted))
+
+
+def make_login_csrf() -> str:
+    token = secrets.token_urlsafe(32)
+    payload = f"{token}|{int(time.time()) + LOGIN_CSRF_MAX_AGE}"
+    encoded = base64.urlsafe_b64encode(payload.encode()).decode()
+    return f"{token}.{encoded}.{_sign(payload)}"
+
+
+def extract_valid_login_csrf(cookie_value: Optional[str]) -> Optional[str]:
+    """Return the unexpired token if the cookie verifies, else None."""
+    if not cookie_value or cookie_value.count(".") != 2:
+        return None
+    token, encoded, sig = cookie_value.split(".", 2)
+    try:
+        payload = base64.urlsafe_b64decode(encoded.encode()).decode()
+    except Exception:
+        return None
+    if not _constant_time_equal(sig, _sign(payload)):
+        return None
+    try:
+        payload_token, expiry = payload.split("|", 1)
+        if _constant_time_equal(payload_token, token) and int(expiry) >= int(time.time()):
+            return token
+    except (ValueError, TypeError):
+        return None
+    return None
+
+
+def verify_login_csrf(cookie_value: Optional[Union[str, list[str]]], submitted: Optional[str]) -> bool:
+    if not cookie_value or not submitted:
+        return False
+    candidates = [cookie_value] if isinstance(cookie_value, str) else cookie_value
+    for cand in candidates:
+        token = extract_valid_login_csrf(cand)
+        if token and _constant_time_equal(token, submitted):
+            return True
+    return False
+
+
 def check_credentials(username: str, password: str) -> bool:
     """Constant-time check of submitted credentials."""
     if not is_enabled():
         return False
     expected_user = _user() or ""
     expected_pw = _password() or ""
-    user_ok = hmac.compare_digest(username.encode(), expected_user.encode())
-    pw_ok = hmac.compare_digest(password.encode(), expected_pw.encode())
+    user_ok = _constant_time_equal(username.encode(), expected_user.encode())
+    pw_ok = _constant_time_equal(password.encode(), expected_pw.encode())
     return user_ok and pw_ok
+
+
+def parse_cookie_values(header_value: Optional[str], cookie_name: str) -> list[str]:
+    """Extract all values for a specific cookie name from the Cookie header."""
+    out: list[str] = []
+    if not header_value:
+        return out
+    for part in header_value.split(";"):
+        if "=" in part:
+            k, _, v = part.strip().partition("=")
+            k = k.strip()
+            v = v.strip()
+            if len(v) >= 2 and v.startswith('"') and v.endswith('"'):
+                v = v[1:-1]
+            if k == cookie_name and v:
+                out.append(v)
+    return out
 
 
 def parse_cookie_header(header_value: Optional[str]) -> dict:
@@ -109,6 +207,10 @@ def parse_cookie_header(header_value: Optional[str]) -> dict:
     for part in header_value.split(";"):
         if "=" in part:
             k, _, v = part.strip().partition("=")
+            k = k.strip()
+            v = v.strip()
+            if len(v) >= 2 and v.startswith('"') and v.endswith('"'):
+                v = v[1:-1]
             out[k] = v
     return out
 
@@ -127,6 +229,13 @@ def cookie_clear_header() -> str:
     return f"{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=0"
 
 
+def login_csrf_cookie_header(value: str) -> str:
+    return (
+        f"{LOGIN_CSRF_COOKIE_NAME}={value}; Path=/; HttpOnly; SameSite=Lax; Secure; "
+        f"Max-Age={LOGIN_CSRF_MAX_AGE}"
+    )
+
+
 # ---------------- HTML ----------------
 
 LOGIN_HTML = """<!doctype html>
@@ -135,6 +244,7 @@ LOGIN_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Token Dashboard — sign in</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>⚡</text></svg>">
 <style>
   :root {
     --bg: #0A0E14; --panel: #0F1419; --panel-2: #131922;
@@ -217,10 +327,11 @@ LOGIN_HTML = """<!doctype html>
   <label for="password">Password</label>
   <input id="password" name="password" type="password" autocomplete="current-password" required>
   <input type="hidden" name="next" value="__NEXT__">
+  <input type="hidden" name="csrf_token" value="__CSRF__">
   <button type="submit">Sign in</button>
   <div class="err">__ERROR__</div>
   <div class="footer">
-    Powered by <a href="https://github.com/dimensigon/HDB-HeliosDB-Nano/" target="_blank" rel="noopener">HeliosDB-Nano</a>
+    __POWERED_BY__
   </div>
 </form>
 </body>
@@ -228,10 +339,15 @@ LOGIN_HTML = """<!doctype html>
 """
 
 
-def render_login(error: str = "", next_path: str = "/") -> bytes:
+def render_login(error: str = "", next_path: str = "/", csrf_token: str = "", db_version: str = "") -> bytes:
     safe_err = (error or "").replace("<", "&lt;").replace(">", "&gt;")
     safe_next = (next_path or "/").replace('"', "%22").replace("<", "")
+    ver = f" {db_version}".strip() if db_version else ""
+    link_text = f"HeliosDB-Nano {ver}".strip()
+    powered_by = f'Powered by <a href="https://github.com/dimensigon/HDB-HeliosDB-Nano/" target="_blank" rel="noopener">{link_text}</a>'
     return (LOGIN_HTML
             .replace("__ERROR__", safe_err)
             .replace("__NEXT__", safe_next)
+            .replace("__CSRF__", csrf_token)
+            .replace("__POWERED_BY__", powered_by)
             .encode("utf-8"))

@@ -21,7 +21,7 @@ export default async function (root) {
     </div>`;
   root.querySelectorAll('button[data-key]').forEach(b => {
     b.addEventListener('click', async () => {
-      await fetch('/api/tips/dismiss', {
+      await api('/api/tips/dismiss', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ key: b.dataset.key }),

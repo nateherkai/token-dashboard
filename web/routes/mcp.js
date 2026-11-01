@@ -239,10 +239,10 @@ export default async function (root) {
     btn.disabled = true;
     btn.textContent = 'Replaying…';
     try {
-      const r = await fetch('/api/mcp/replay', {
+      const r = await api('/api/mcp/replay', {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({ recent: 5 })
-      }).then(r => r.json());
+      });
       const ok = (r.replays || []).filter(x => x.ok).length;
       btn.textContent = `Replay 5 recent — ${ok}/${(r.replays||[]).length} ok`;
       setTimeout(() => { btn.textContent = 'Replay 5 recent'; btn.disabled = false; }, 4000);
@@ -259,7 +259,7 @@ export default async function (root) {
     btn.disabled = true;
     btn.textContent = 'Rescan started…';
     try {
-      const r = await fetch('/api/scan/force').then(r => r.json());
+      const r = await api('/api/scan/force', { method: 'POST' });
       btn.textContent = r.ok ? 'Rescan running in background' : 'Rescan failed';
     } catch (e) {
       btn.textContent = 'Failed: ' + String(e);
@@ -273,10 +273,10 @@ export default async function (root) {
       const id = btn.dataset.replayId;
       btn.disabled = true; btn.textContent = '…';
       try {
-        const r = await fetch('/api/mcp/replay', {
+        const r = await api('/api/mcp/replay', {
           method:'POST', headers:{'Content-Type':'application/json'},
           body: JSON.stringify({ call_id: parseInt(id, 10) })
-        }).then(r => r.json());
+        });
         btn.textContent = r.ok ? `${r.response_tokens}t · ${r.took_ms}ms` : 'fail';
         btn.title = r.detail || '';
       } catch (e) {

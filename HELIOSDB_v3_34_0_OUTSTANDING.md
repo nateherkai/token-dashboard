@@ -5,6 +5,82 @@ on 2026-05-31 (built from tag `v3.34.0`, features `code-graph,graph-rag,mcp-endp
 serving a ~448k-message corpus over the PG wire (pg8000) + HTTP. Access modes:
 `psql`/pg8000 on `:5440` (PG wire) and `curl` on `:18090` (HTTP).
 
+## 🎉 v3.37.0 (2026-06-04) — #1 MCP-over-HTTP FIXED → ALL 7 TD issues closed
+
+v3.37.0 ("Token Dashboard MCP-over-HTTP support" release; tag `v3.37.0` / `82949fa`) closes the last
+open item, **#1**, in both halves — verified against the running binary:
+- **MCP-over-HTTP routes mounted on `--http-port`.** `GET /mcp/info` returns real capabilities
+  (`protocolVersion 2024-11-05`, tools+resources). `POST /mcp` `initialize` → `serverInfo
+  {name: heliosdb-nano, version: 3.37.0}`; `tools/list` → a real catalog (`heliosdb_query`,
+  `heliosdb_schema`, `heliosdb_list_tables`, `heliosdb_create_table`, `heliosdb_insert`, branch ops…).
+  `/health` still serves `{"status":"ok"}` on its own route (no longer a catch-all).
+- **`CODE_EMBED(text)` SQL function** returns a real 384-dim embedding vector (not the BLAKE2b hash
+  fallback) — the dashboard's semantic search / clustering / dup-retrieval can now use real embeddings.
+- #2–#7 all held (no regressions): SHOW BRANCHES lists names, CREATE SCHEMA OK, CTE+`$param` → 5.
+
+**ALL 7 original TD issues are now resolved:** #1 MCP-over-HTTP → v3.37.0 · #2 MV `COUNT(*)` →
+v3.35.0 · #3 CTE+`$param` → v3.36.0 · #4 `SHOW BRANCHES` → v3.36.2 · #5 `CREATE SCHEMA` → v3.36.0 ·
+#6 MV-column `SUM` type → v3.35.0 · #7 cold-start → v3.35.0.
+
+---
+
+## ✅ v3.36.2 (2026-06-04) — TD#4 fixed; #1 MCP-over-HTTP is the ONLY remaining item
+
+v3.36.2 (`caba972`, `main`) fixed **TD#4 SHOW BRANCHES** — verified on the live prod instance: it now
+lists named branches (`name|id|parent|ts|status`), including ones older binaries left in the data-dir
+(so it's a real planner/projection fix, not a fresh-data-dir artifact). #3/#5 not regressed; data 6/6;
+dashboard sub-second. Prod engine is now v3.36.2.
+
+**Status of the original 7 TD issues: 6 fixed (#2, #3, #4, #5, #6, #7); 1 remaining → #1.**
+
+The sole open item is **#1 — MCP routes not mounted on the daemon's `--http-port`** (deferred as a
+*feature*, not a bug). Full details + repro + suggested fix are in section **"### 1."** below. In short:
+`heliosdb-nano start` serves only a health responder on `--http-port` (every path → `{"status":"ok"}`),
+there is no `--mcp` flag and no `mcp` subcommand, and `code_embed` isn't exposed as a SQL function — so
+an MCP-over-HTTP client (and real semantic embeddings) have nothing to talk to. **Fix:** mount the MCP
+JSON-RPC router (POST `/mcp`) + a `code_embed` SQL function on the `--http-port` listener, or add a
+`heliosdb-nano mcp` subcommand.
+
+---
+
+## ✔ v3.36.1 verification (2026-06-03)
+
+Built **v3.36.1** (tag `v3.36.1` / `release: 0b46fc9`) on gpc001gb-wg, deployed to the dashboard's
+instance (reads the v3.35.0 data-dir cleanly; cold-start ~12 s). Independently verified the
+v3.36.0 claims against the running binary:
+
+| # | Issue | v3.36.0 claim | v3.36.1 verified |
+|---|---|---|---|
+| 1 | MCP routes on `--http-port` | DEFERRED | ✅ confirmed deferred — still `{"status":"ok"}` health-only; subcommands are only `start`/`stop`/`status` (no `mcp`) |
+| 3 | CTE + `$param` | FIXED | ✅ **confirmed FIXED** — `WITH x AS (SELECT 5 AS n) SELECT n FROM x WHERE n>=$1` returns 5; CTE `COUNT(1)` = flat `COUNT(1)` = 104,856 |
+| 4 | `SHOW BRANCHES` | FIXED | ❌ **NOT fixed** — see below |
+| 5 | `CREATE SCHEMA` | FIXED | ✅ **confirmed FIXED** — `CREATE SCHEMA IF NOT EXISTS` accepted as a no-op; the per-write schema warning is gone |
+
+Held from earlier: #2 `COUNT(*)` over MV, #6 MV-column `SUM`→int, #7 cold-start; real 200-row
+DELETE **0.713 s**; live-JOIN `/api/tools` **0.011 s**; data exactness now **6/6** (the live-session
+`tools` drift settled).
+
+**#4 `SHOW BRANCHES` — claim contradicted on a fresh data-dir.** The v3.36.0 note attributed the
+blank row to "a branch registry persisted by an older binary; re-test on a fresh data dir." Did
+exactly that — a brand-new v3.36.1 instance on an empty data-dir, seeded a table + rows, created
+two named branches (`'alpha'`, `'beta'`, both `OK 0`):
+```
+SHOW BRANCHES;
+ branches
+----------
+
+(1 row)
+```
+Still **one blank-name row**; `alpha`/`beta` are not listed. `fix(TD#4)` routes `SHOW BRANCHES`
+through the planner (it no longer errors) but does not populate the branch names — branches remain
+un-enumerable from SQL even on a clean data-dir, so the "old binary registry" explanation doesn't
+hold.
+
+**Net across the original 7:** 5 fixed (#2, #3, #5, #6, #7), 1 deferred feature (#1), 1 still-open
+despite the FIXED claim (#4).
+
+---
+
 ## ✅ v3.36.0 retest (2026-06-02) — the 4 remaining items resolved or deferred
 
 Released as **v3.36.0** (HeliosDB-Nano PR #4, merged to `main`). Re-status of the

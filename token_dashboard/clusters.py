@@ -9,10 +9,13 @@ data the dashboard sees (~hundreds to low-thousands of unique prompts).
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import random
+import struct
 import time
+from numbers import Real
 from typing import Optional
 
 from . import helios_writer as hw
@@ -32,26 +35,29 @@ def cluster_prompts(k: int = 8, max_iter: int = 20, project_slug: Optional[str] 
         args = (project_slug,)
     if args:
         cur.execute(f"""
-          SELECT uuid, prompt_text, body_vec
+          SELECT uuid, prompt_text, CAST(body_vec AS TEXT)
             FROM dashboard.messages
            WHERE {where}
            LIMIT 5000
         """, args)
     else:
         cur.execute(f"""
-          SELECT uuid, prompt_text, body_vec
+          SELECT uuid, prompt_text, CAST(body_vec AS TEXT)
             FROM dashboard.messages
            WHERE {where}
            LIMIT 5000
         """)
     rows = cur.fetchall()
-    if len(rows) < k * 2:
-        return {"ok": False, "error": f"need ≥{k*2} prompts, found {len(rows)}"}
     uuids = [r[0] for r in rows]
     previews = [(r[1] or "")[:120] for r in rows]
     # Vectors come back as a string-ish or list-ish form depending on driver;
     # parse robustly.
-    vectors = [_parse_vector(r[2]) for r in rows]
+    try:
+        vectors = [_parse_vector(r[2]) for r in rows]
+    except ValueError as exc:
+        return {"ok": False, "error": f"invalid vector: {exc}"}
+    if len(rows) < k * 2:
+        return {"ok": False, "error": f"need ≥{k*2} prompts, found {len(rows)}"}
 
     rng = random.Random(seed)
     # k-means++ init. If all distances collapse to 0 (e.g. when hash
@@ -183,19 +189,48 @@ def cluster_members(cluster_id: int, limit: int = 50) -> list:
 
 def _parse_vector(raw) -> list:
     if raw is None:
-        return [0.0] * 384
-    if isinstance(raw, list):
-        return [float(x) for x in raw]
-    if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode("utf-8", errors="replace")
-    s = str(raw).strip()
-    if s.startswith("[") and s.endswith("]"):
-        s = s[1:-1]
-    parts = [p.strip() for p in s.split(",") if p.strip()]
-    try:
-        return [float(p) for p in parts]
-    except ValueError:
-        return [0.0] * 384
+        raise ValueError("missing vector")
+    if isinstance(raw, (list, tuple)):
+        values = raw
+    else:
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                raw = raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("invalid text") from exc
+        try:
+            values = json.loads(str(raw), parse_constant=_reject_json_constant)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid vector JSON") from exc
+        if not isinstance(values, list):
+            raise ValueError("vector JSON must be an array")
+
+    if len(values) != 384:
+        raise ValueError(f"expected 384 coordinates, found {len(values)}")
+    parsed = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError("coordinates must be numeric")
+        try:
+            value = float(value)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("coordinates must be finite float32 values") from exc
+        if not math.isfinite(value):
+            raise ValueError("coordinates must be finite")
+        try:
+            float32_value = struct.unpack("<f", struct.pack("<f", value))[0]
+        except (OverflowError, struct.error) as exc:
+            raise ValueError("coordinates must be float32-representable") from exc
+        if value != 0.0 and float32_value == 0.0:
+            raise ValueError("coordinates must be float32-representable")
+        parsed.append(value)
+    if math.hypot(*parsed) == 0.0:
+        raise ValueError("vector norm must be nonzero")
+    return parsed
+
+
+def _reject_json_constant(value):
+    raise ValueError("non-finite JSON number")
 
 
 def _l2(a: list, b: list) -> float:

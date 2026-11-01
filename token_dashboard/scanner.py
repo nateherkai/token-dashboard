@@ -341,6 +341,13 @@ def scan_dir(projects_root: Union[str, Path], db_path: Union[str, Path]) -> dict
             totals["alerts"] = len(new_alerts)
         except Exception as e:
             totals["alerts"] = f"alerts-err:{e}"
+    try:
+        from . import budgets as budgets_mod
+        totals["budget_alerts"] = len(budgets_mod.check_budgets(
+            db_path, Path(__file__).resolve().parent.parent / "pricing.json"))
+    except Exception as e:
+        totals["budget_alerts"] = f"budget-err:{e}"
+    if sink is not None:
         # Keep the rollup MVs current. ensure is idempotent; refresh only
         # when this scan actually ingested new rows.
         try:

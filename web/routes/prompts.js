@@ -60,7 +60,7 @@ export default async function (root) {
               <td class="num">${fmt.int(r.cache_read_tokens)}</td>
               <td class="num ${r.mcp_calls ? '' : 'muted'}">${r.mcp_calls ? fmt.int(r.mcp_calls) : '—'}</td>
               <td class="num ${r.savings_tokens ? 'savings-good' : 'muted'}">${r.savings_tokens ? fmt.compact(r.savings_tokens) : '—'}</td>
-              <td><a href="#/sessions/${encodeURIComponent(r.session_id)}" class="mono" onclick="event.stopPropagation()">${fmt.htmlSafe(r.session_id.slice(0,8))}…</a></td>
+              <td><a href="#/sessions/${encodeURIComponent(r.session_id)}" class="mono">${fmt.htmlSafe(r.session_id.slice(0,8))}…</a></td>
             </tr>`).join('') || '<tr><td colspan="8" class="muted">no prompts yet</td></tr>'}
         </tbody>
       </table>
@@ -73,6 +73,9 @@ export default async function (root) {
   });
 
   root.querySelectorAll('#prompts tbody tr').forEach(tr => {
+    tr.querySelectorAll('a').forEach(link => {
+      link.addEventListener('click', event => event.stopPropagation());
+    });
     tr.addEventListener('click', () => {
       const r = rows[Number(tr.dataset.i)];
       const drawer = document.getElementById('drawer');

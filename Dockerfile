@@ -22,7 +22,13 @@ ENV HOST=0.0.0.0 \
 # Embedded mode requires the heliosdb-nano binary on PATH (or override via
 # HELIOSDB_BIN) — install separately or mount from the host.
 
-RUN mkdir -p /data/cache
+RUN groupadd --gid 1001 token-dashboard \
+    && useradd --uid 1001 --gid 1001 --create-home \
+        --home-dir /home/token-dashboard --shell /usr/sbin/nologin token-dashboard \
+    && mkdir -p /data/cache \
+    && chown 1001:1001 /data/cache
+
+USER 1001:1001
 
 EXPOSE 8080
 

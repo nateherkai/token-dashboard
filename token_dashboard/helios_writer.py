@@ -87,9 +87,9 @@ def get_conn():
     pg8000 connections are not thread-safe, and the server is threaded (see
     `_tlocal` note above), so each thread keeps its own connection. The
     connection is health-checked ("SELECT 1") and transparently reconnected if
-    the socket has died. Threads are bounded by browser-parallel connections
-    (keep-alive reuses the thread/connection across requests), so this does not
-    cause meaningful connection churn."""
+    the socket has died. The server bounds HTTP workers and closes cached
+    connections when each worker finishes. Scan tasks close theirs after each
+    run; other callers must explicitly release their own thread's connection."""
     conn = getattr(_tlocal, "conn", None)
     if conn is not None:
         try:
@@ -317,6 +317,11 @@ def _reset_conn() -> None:
         pass
     _tlocal.conn = None
     # leave _schema_ok = True so we don't re-run DDL
+
+
+def close_thread_connection() -> None:
+    """Release the caller's cached connection when its unit of work finishes."""
+    _reset_conn()
 
 
 def _is_connection_dead(e: Exception) -> bool:
@@ -639,3 +644,52 @@ def stats() -> dict:
         except Exception as e:
             out[label] = {"error": str(e)[:160]}
     return out
+
+
+_CACHED_SERVER_VERSION: Optional[str] = None
+_SERVER_VERSION_LOCK = threading.Lock()
+
+
+def fetch_server_version() -> str:
+    """Query database version once from the DB and cache for the app lifecycle."""
+    global _CACHED_SERVER_VERSION
+    if _CACHED_SERVER_VERSION is not None:
+        return _CACHED_SERVER_VERSION
+    with _SERVER_VERSION_LOCK:
+        if _CACHED_SERVER_VERSION is not None:
+            return _CACHED_SERVER_VERSION
+        if not is_configured():
+            _CACHED_SERVER_VERSION = ""
+            return _CACHED_SERVER_VERSION
+        try:
+            conn = get_conn()
+            if conn:
+                cur = conn.cursor()
+                cur.execute("SELECT version()")
+                row = cur.fetchone()
+                _CACHED_SERVER_VERSION = str(row[0]) if row and row[0] else ""
+        except Exception:
+            _CACHED_SERVER_VERSION = ""
+        return _CACHED_SERVER_VERSION
+
+
+def get_nano_version() -> str:
+    """Return parsed Nano version like 'v4.41.0' or '' if not detectable."""
+    raw = fetch_server_version()
+    if not raw:
+        return ""
+    import re
+    m = re.search(r"HeliosDB Nano\s+([\d.]+)", raw)
+    if m:
+        return f"v{m.group(1)}"
+    m2 = re.search(r"Nano\s+([\d.]+)", raw)
+    if m2:
+        return f"v{m2.group(1)}"
+    return ""
+
+
+def get_powered_by_message() -> str:
+    """Dynamic 'powered by HeliosDB-Nano [version]' string loaded once from DB."""
+    v = get_nano_version()
+    return f"powered by HeliosDB-Nano {v}" if v else "powered by HeliosDB-Nano"
+

@@ -31,7 +31,7 @@ export default async function (root) {
     <div class="flex" style="margin-bottom:14px">
       <h2 style="margin:0;font-size:16px">Insights — semantic, structural, audit</h2>
       <div class="spacer"></div>
-      <span class="pill ${realEmb ? '' : 'muted'}" title="${realEmb ? 'BGE-Small via HeliosDB code-embed' : 'fallback hash embedding — semantic results will be poor'}">${realEmb ? 'real embeddings' : 'hash fallback'}</span>
+      <span class="pill ${realEmb ? '' : 'muted'}" title="${realEmb ? 'Validated vectors via HeliosDB code-embed; legacy corpus provenance is not verified' : 'Embedding service unavailable — new vectors are skipped; legacy corpus provenance is not verified'}">${realEmb ? 'embedding service available' : 'embeddings unavailable'}</span>
     </div>
 
     <div class="row cols-7">
@@ -40,7 +40,7 @@ export default async function (root) {
         <div class="value">${fmt.compact(s.messages || 0)}</div>
         <div class="sub">messages ingested</div>
       </div>
-      <div class="card kpi" title="Subset of mirrored messages with a 384-dim BGE-Small embedding stored in body_vec. Search & clustering operate on these.">
+      <div class="card kpi" title="Mirrored messages with body_vec set. Legacy vector provenance has not yet been verified; this count does not prove semantic quality.">
         <div class="label">— with embedding</div>
         <div class="value">${fmt.compact(s.messages_with_embedding || 0)}</div>
       </div>
@@ -226,7 +226,7 @@ export default async function (root) {
     const btn = document.getElementById('cluster-build');
     btn.disabled = true; btn.textContent = 'building…';
     try {
-      const r = await fetch('/api/clusters/build', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({k: 8})}).then(r=>r.json());
+      const r = await api('/api/clusters/build', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({k: 8})});
       if (r.ok) {
         const fresh = await api('/api/clusters');
         document.getElementById('clusters-body').innerHTML = renderClusters(fresh.clusters || []);
@@ -256,7 +256,7 @@ export default async function (root) {
   root.querySelectorAll('.ack-btn').forEach(btn => {
     btn.addEventListener('click', async () => {
       btn.disabled = true;
-      await fetch('/api/alerts/ack', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id: parseInt(btn.dataset.id,10)})});
+      await api('/api/alerts/ack', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id: parseInt(btn.dataset.id,10)})});
       btn.closest('tr').remove();
     });
   });
@@ -266,7 +266,7 @@ export default async function (root) {
     const btn = document.getElementById('snap-btn');
     btn.disabled = true; btn.textContent = 'snapping…';
     try {
-      const r = await fetch('/api/branches/snapshot', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}).then(r=>r.json());
+      const r = await api('/api/branches/snapshot', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
       btn.textContent = r.ok ? `created ${r.branch}` : (r.error || 'failed');
     } catch (e) { btn.textContent = 'failed'; }
     setTimeout(()=>{ btn.disabled=false; btn.textContent='snapshot today'; }, 4000);
@@ -300,7 +300,7 @@ export default async function (root) {
     if (!slug) { btn.textContent = 'enter a slug'; return; }
     btn.disabled = true; btn.textContent = 'ingesting…';
     try {
-      const r = await fetch('/api/docs/ingest', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({project_slug: slug})}).then(r=>r.json());
+        const r = await api('/api/docs/ingest', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({project_slug: slug})});
       btn.textContent = r.ok ? `${r.chunks} chunks` : (r.error || 'failed');
     } catch (e) { btn.textContent = 'failed'; }
     setTimeout(()=>{ btn.disabled=false; btn.textContent='ingest docs'; }, 5000);
@@ -313,7 +313,7 @@ export default async function (root) {
     if (!cwd) { btn.textContent = 'enter a path'; return; }
     btn.disabled = true; btn.textContent = 'indexing…';
     try {
-      const r = await fetch('/api/code-graph/index', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({cwd})}).then(r=>r.json());
+        const r = await api('/api/code-graph/index', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({cwd})});
       btn.textContent = r.ok ? `ok ${r.elapsed_ms || ''}ms` : (r.error || 'failed');
     } catch (e) { btn.textContent = 'failed'; }
     setTimeout(()=>{ btn.disabled=false; btn.textContent='index'; }, 5000);

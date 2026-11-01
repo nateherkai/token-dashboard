@@ -80,7 +80,8 @@ def migrate(db_path: str, limit_messages: int = 5000,
             if msg.get("type") == "user" and len(text) >= embed_user_min_chars:
                 try:
                     vec = embedder.embed(text)
-                    n_emb_msg += 1
+                    if vec is not None:
+                        n_emb_msg += 1
                 except Exception:
                     vec = None
             try:

@@ -23,8 +23,30 @@ export const fmt = {
   ts: t => (t || '').slice(0, 16).replace('T', ' '),
 };
 
-export async function api(path, opts) {
-  const r = await fetch(path, opts);
+let csrfTokenPromise;
+
+async function csrfToken() {
+  if (!csrfTokenPromise) {
+    csrfTokenPromise = fetch('/api/csrf').then(r => {
+      if (!r.ok) throw new Error(`CSRF bootstrap → ${r.status}`);
+      return r.json();
+    }).then(data => data.csrf_token || null).catch(error => {
+      csrfTokenPromise = undefined;
+      throw error;
+    });
+  }
+  return csrfTokenPromise;
+}
+
+export async function api(path, opts = {}) {
+  const request = { ...opts };
+  const method = (request.method || 'GET').toUpperCase();
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && path !== '/api/csrf') {
+    const token = await csrfToken();
+    request.headers = new Headers(request.headers || {});
+    if (token) request.headers.set('X-TD-CSRF', token);
+  }
+  const r = await fetch(path, request);
   if (!r.ok) throw new Error(`${path} → ${r.status}`);
   return r.json();
 }
@@ -72,6 +94,10 @@ async function paintHeliosPill() {
       return;
     }
     pill.style.display = '';
+    if (st.powered_by) {
+      pill.innerHTML = `⚡ ${st.powered_by}`;
+      return;
+    }
     const version = (st.server_version || '').match(/HeliosDB Nano ([\d.]+)/);
     const v = version ? `v${version[1]}` : '';
     pill.innerHTML = `⚡ powered by HeliosDB-Nano${v ? ' ' + v : ''}`;
@@ -143,7 +169,7 @@ async function firstRun() {
   document.body.appendChild(overlay);
   await new Promise(res => $('#firstsave', overlay).addEventListener('click', async () => {
     const plan = $('#firstplan', overlay).value;
-    await fetch('/api/plan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ plan }) });
+    await api('/api/plan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ plan }) });
     localStorage.setItem('td.plan-set', '1');
     overlay.remove();
     res();

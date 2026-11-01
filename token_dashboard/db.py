@@ -132,6 +132,14 @@ CREATE TABLE IF NOT EXISTS dismissed_tips (
   tip_key       TEXT PRIMARY KEY,
   dismissed_at  REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS project_budgets (
+  project_slug TEXT PRIMARY KEY,
+  daily_usd REAL,
+  monthly_usd REAL,
+  alert_webhook TEXT,
+  updated_at REAL NOT NULL
+);
 """
 
 

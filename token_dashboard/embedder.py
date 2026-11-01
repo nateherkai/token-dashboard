@@ -1,25 +1,11 @@
-"""Embedder shim — turns text into 384-dim BGE-Small vectors.
-
-We don't ship fastembed inside the dashboard image (it's ~150 MB of ONNX
-runtime + model). Instead, we call HeliosDB's MCP `code_embed` tool over
-the existing MCP_HTTP_URL — the embedder lives where the rest of the
-embeddings live.
-
-Falls back to a deterministic hash-based embedding if MCP is not
-reachable (so the rest of the pipeline still runs in dev). The hash
-embedding is clearly labelled and the vector_search code knows to
-backfill it when MCP comes back.
-"""
+"""MCP-backed semantic embeddings for the token dashboard."""
 from __future__ import annotations
 
-import hashlib
 import json
 import math
-import os
-import struct
 import threading
-import time
-from typing import Optional
+from numbers import Real
+from typing import Any, Optional
 
 from . import mcp as mcp_client
 
@@ -28,60 +14,95 @@ EMBED_DIM = 384
 
 
 _lock = threading.Lock()
-_cache: dict[str, list] = {}
-_cache_max = 5000  # bound the cache; LRU eviction by insertion order
+_cache: dict[str, list[float]] = {}
+_cache_max = 5000
 
 
-def _cache_get(text: str) -> Optional[list]:
-    return _cache.get(text)
+def _cache_get(text: str) -> Optional[list[float]]:
+    with _lock:
+        vector = _cache.get(text)
+        return list(vector) if vector is not None else None
 
 
-def _cache_put(text: str, vec: list) -> None:
+def _cache_put(text: str, vector: list[float]) -> None:
     with _lock:
         if len(_cache) >= _cache_max:
-            # drop oldest 10% in one pass
-            to_drop = len(_cache) // 10
-            for k in list(_cache.keys())[:to_drop]:
-                _cache.pop(k, None)
-        _cache[text] = vec
+            to_drop = max(1, len(_cache) // 10)
+            for key in list(_cache)[:to_drop]:
+                _cache.pop(key, None)
+        _cache[text] = list(vector)
 
 
-# ---------- Hash fallback ----------
+def _validate_vector(value: Any) -> Optional[list[float]]:
+    if not isinstance(value, list) or len(value) != EMBED_DIM:
+        return None
 
-def _hash_embedding(text: str) -> list:
-    """Deterministic 384-dim vector from BLAKE2b. Clearly NOT a real
-    semantic embedding — used only when MCP code_embed is unreachable so
-    upstream code can still run end-to-end.
+    vector: list[float] = []
+    try:
+        for coordinate in value:
+            if isinstance(coordinate, bool) or not isinstance(coordinate, Real):
+                return None
+            converted = float(coordinate)
+            if not math.isfinite(converted) or abs(converted) > 3.4028234663852886e38:
+                return None
+            vector.append(converted)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
-    BLAKE2b output bytes interpreted as IEEE 754 floats can be NaN/inf/denorms;
-    we rejection-sample to keep the vector finite, then unit-normalise.
-    """
-    seed = text.encode("utf-8", errors="replace")
-    floats: list[float] = []
-    counter = 0
-    while len(floats) < EMBED_DIM:
-        h = hashlib.blake2b(seed + counter.to_bytes(4, "big"), digest_size=64)
-        for j in range(0, 64, 4):
-            (f,) = struct.unpack("f", h.digest()[j:j + 4])
-            if math.isfinite(f) and abs(f) < 1e6:
-                # Map roughly to [-1, 1] so the cosine has reasonable magnitude
-                f = max(-1.0, min(1.0, f / 1000.0))
-                floats.append(f)
-                if len(floats) >= EMBED_DIM:
-                    break
-        counter += 1
-        if counter > 64:  # safety bail (shouldn't happen)
-            while len(floats) < EMBED_DIM:
-                floats.append(0.0)
-            break
-    norm = math.sqrt(sum(f * f for f in floats)) or 1.0
-    return [f / norm for f in floats]
+    if not any(round(coordinate, 6) != 0.0 for coordinate in vector):
+        return None
+    return vector
 
 
-# ---------- MCP-backed embedder ----------
+def _candidate_from_mapping(mapping: Any) -> Optional[list[float]]:
+    if not isinstance(mapping, dict):
+        return None
+    for key in ("embedding", "vector", "body_vec"):
+        if key in mapping:
+            vector = _validate_vector(mapping[key])
+            if vector is not None:
+                return vector
+    return None
 
-def _via_mcp(text: str) -> Optional[list]:
-    """Call HeliosDB's code_embed MCP tool. Returns None if unavailable."""
+
+def _vectors_from_content(result: Any) -> list[Any]:
+    if not isinstance(result, dict) or result.get("isError"):
+        return []
+
+    candidates: list[Any] = []
+    structured = _candidate_from_mapping(result)
+    if structured is not None:
+        candidates.append(structured)
+
+    structured = _candidate_from_mapping(result.get("structuredContent"))
+    if structured is not None:
+        candidates.append(structured)
+
+    content = result.get("content")
+    if not isinstance(content, list):
+        return candidates
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        structured = _candidate_from_mapping(block)
+        if structured is not None:
+            candidates.append(structured)
+
+        text = block.get("text")
+        if not isinstance(text, str):
+            continue
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        structured = _candidate_from_mapping(payload)
+        if structured is not None:
+            candidates.append(structured)
+    return candidates
+
+
+def _via_mcp(text: str) -> Optional[list[float]]:
+    """Call MCP and return only a structurally validated provider vector."""
     if not mcp_client.is_configured():
         return None
     try:
@@ -93,61 +114,38 @@ def _via_mcp(text: str) -> Optional[list]:
         )
     except Exception:
         return None
-    # The MCP tool returns content blocks; extract the structured embedding.
-    for block in result.get("content") or []:
-        if not isinstance(block, dict):
-            continue
-        # Text-encoded JSON block
-        t = block.get("text")
-        if isinstance(t, str):
-            try:
-                payload = json.loads(t)
-            except Exception:
-                continue
-            vec = payload.get("embedding") or payload.get("vector") or payload.get("body_vec")
-            if isinstance(vec, list) and len(vec) == EMBED_DIM:
-                return [float(x) for x in vec]
-        # Already a structured embedding block (some servers do this)
-        for key in ("embedding", "vector"):
-            if key in block and isinstance(block[key], list) and len(block[key]) == EMBED_DIM:
-                return [float(x) for x in block[key]]
+
+    for candidate in _vectors_from_content(result):
+        vector = _validate_vector(candidate)
+        if vector is not None:
+            return vector
     return None
 
 
-# ---------- Public API ----------
-
-def embed(text: str) -> list:
-    """Return a 384-dim embedding. Tries MCP first, falls back to hash.
-
-    Cached per-process. Caller never gets None — if MCP fails, the hash
-    embedding is returned so the pipeline keeps moving; the writer marks
-    such rows for refresh."""
+def embed(text: str) -> Optional[list[float]]:
+    """Return a validated provider embedding, or ``None`` on failure."""
     if text is None:
         text = ""
-    text = text.strip()[:8000]  # bound payload size
+    elif not isinstance(text, str):
+        text = str(text)
+    text = text.strip()[:8000]
+
     cached = _cache_get(text)
     if cached is not None:
         return cached
-    vec = _via_mcp(text) or _hash_embedding(text)
-    _cache_put(text, vec)
-    return vec
+
+    vector = _via_mcp(text)
+    if vector is None:
+        return None
+    _cache_put(text, vector)
+    return list(vector)
 
 
-def embed_batch(texts: list) -> list:
-    """Convenience — embed N texts, returns a list of vectors.
-
-    No MCP batch endpoint is assumed; we just iterate. The cache absorbs
-    duplicates."""
-    return [embed(t) for t in texts]
+def embed_batch(texts: list) -> list[Optional[list[float]]]:
+    """Embed each text independently, preserving failures as ``None``."""
+    return [embed(text) for text in texts]
 
 
 def is_real_embedding_available() -> bool:
-    """True if MCP code_embed is reachable (real embeddings flow). False
-    if we're falling back to the hash shim."""
-    if not mcp_client.is_configured():
-        return False
-    try:
-        v = _via_mcp("token-dashboard probe")
-        return v is not None
-    except Exception:
-        return False
+    """Return whether a probe produces a structurally valid provider vector."""
+    return _via_mcp("token-dashboard probe") is not None
