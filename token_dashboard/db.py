@@ -1,12 +1,47 @@
-"""SQLite schema, connection, and shared query helpers."""
+"""SQLite schema, connection, and shared query helpers.
+
+Backend selection (env-driven, decided once at import):
+
+* ``TOKEN_DASHBOARD_BACKEND=sqlite`` — force the stdlib ``sqlite3`` module
+  (legacy / dev / CI without HeliosDB available).
+* ``TOKEN_DASHBOARD_BACKEND=heliosdb`` — force the ``heliosdb_sqlite`` shim.
+* ``TOKEN_DASHBOARD_BACKEND=auto`` (default) — prefer ``heliosdb_sqlite``
+  if it is installed; fall back to stdlib ``sqlite3``.
+
+When using HeliosDB:
+
+* ``HELIOSDB_DSN`` set → daemon mode (psycopg2 → running ``heliosdb-nano start``
+  on PG wire). Faster per-query latency; expects a server in the background.
+* ``HELIOSDB_DSN`` unset → embedded mode (spawns ``heliosdb-nano repl`` per
+  connection). Zero-config, single-file ergonomics; slower per-query.
+"""
 from __future__ import annotations
 
 import os
 import re
-import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Union
+
+# ----------------------------------------------------------------------
+# Backend resolution
+# ----------------------------------------------------------------------
+_BACKEND_PREF = os.environ.get("TOKEN_DASHBOARD_BACKEND", "auto").lower()
+_HELIOSDB_DSN = os.environ.get("HELIOSDB_DSN")
+
+if _BACKEND_PREF == "sqlite":
+    import sqlite3  # type: ignore[import]
+    _USING_HELIOSDB = False
+elif _BACKEND_PREF == "heliosdb":
+    import heliosdb_sqlite as sqlite3  # type: ignore[no-redef]
+    _USING_HELIOSDB = True
+else:  # "auto"
+    try:
+        import heliosdb_sqlite as sqlite3  # type: ignore[no-redef]
+        _USING_HELIOSDB = True
+    except ImportError:
+        import sqlite3  # type: ignore[import]
+        _USING_HELIOSDB = False
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -49,19 +84,44 @@ CREATE INDEX IF NOT EXISTS idx_messages_model     ON messages(model);
 CREATE INDEX IF NOT EXISTS idx_messages_msgid     ON messages(session_id, message_id);
 
 CREATE TABLE IF NOT EXISTS tool_calls (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  message_uuid  TEXT    NOT NULL,
-  session_id    TEXT    NOT NULL,
-  project_slug  TEXT    NOT NULL,
-  tool_name     TEXT    NOT NULL,
-  target        TEXT,
-  result_tokens INTEGER,
-  is_error      INTEGER NOT NULL DEFAULT 0,
-  timestamp     TEXT    NOT NULL
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_uuid          TEXT    NOT NULL,
+  session_id            TEXT    NOT NULL,
+  project_slug          TEXT    NOT NULL,
+  tool_name             TEXT    NOT NULL,
+  target                TEXT,
+  tool_use_id           TEXT,
+  result_tokens         INTEGER,
+  is_error              INTEGER NOT NULL DEFAULT 0,
+  timestamp             TEXT    NOT NULL,
+  baseline_tokens       INTEGER,
+  baseline_method       TEXT,
+  resolution            TEXT,
+  followup_within_turn  INTEGER,
+  mcp_meta_json         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tools_session ON tool_calls(session_id);
 CREATE INDEX IF NOT EXISTS idx_tools_name    ON tool_calls(tool_name);
 CREATE INDEX IF NOT EXISTS idx_tools_target  ON tool_calls(target);
+CREATE INDEX IF NOT EXISTS idx_tools_msguuid ON tool_calls(message_uuid);
+CREATE INDEX IF NOT EXISTS idx_tools_project ON tool_calls(project_slug);
+CREATE INDEX IF NOT EXISTS idx_tools_useid   ON tool_calls(tool_use_id);
+
+CREATE TABLE IF NOT EXISTS mcp_replay (
+  call_id           INTEGER PRIMARY KEY,
+  tool_name         TEXT    NOT NULL,
+  replayed_at       REAL    NOT NULL,
+  response_tokens   INTEGER,
+  took_ms           INTEGER,
+  ok                INTEGER NOT NULL,
+  detail            TEXT,
+  FOREIGN KEY (call_id) REFERENCES tool_calls(id)
+);
+
+CREATE TABLE IF NOT EXISTS mcp_state (
+  k TEXT PRIMARY KEY,
+  v TEXT
+);
 
 CREATE TABLE IF NOT EXISTS plan (
   k TEXT PRIMARY KEY,
@@ -71,6 +131,14 @@ CREATE TABLE IF NOT EXISTS plan (
 CREATE TABLE IF NOT EXISTS dismissed_tips (
   tip_key       TEXT PRIMARY KEY,
   dismissed_at  REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_budgets (
+  project_slug TEXT PRIMARY KEY,
+  daily_usd REAL,
+  monthly_usd REAL,
+  alert_webhook TEXT,
+  updated_at REAL NOT NULL
 );
 """
 
@@ -82,8 +150,11 @@ def default_db_path() -> Path:
 def init_db(path: Union[str, Path]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as c:
+    # Use the shared connect() helper so backend / daemon-mode resolution
+    # is consistent across init and runtime queries.
+    with connect(path) as c:
         _migrate_add_message_id(c)
+        _migrate_add_tool_columns(c)
         c.executescript(SCHEMA)
 
 
@@ -110,10 +181,64 @@ def _migrate_add_message_id(conn) -> None:
     conn.commit()
 
 
+def _migrate_add_tool_columns(conn) -> None:
+    """Add savings/quality columns to tool_calls. Non-destructive (no data loss).
+
+    Backfills tool_use_id on existing `_tool_result` rows from `target` (where
+    the value already lives). Existing tool_use rows from pre-migration scans
+    can't recover their tool_use_id without re-reading the JSONL — they get
+    attributed only on the next scan that re-reads them. New scans capture
+    tool_use_id natively for both shapes.
+    """
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tool_calls'"
+    ).fetchone()
+    if not has_table:
+        return
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(tool_calls)")}
+    additions = [
+        ("tool_use_id",          "TEXT"),
+        ("baseline_tokens",      "INTEGER"),
+        ("baseline_method",      "TEXT"),
+        ("resolution",           "TEXT"),
+        ("followup_within_turn", "INTEGER"),
+        ("mcp_meta_json",        "TEXT"),
+    ]
+    changed = False
+    for name, ddl in additions:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE tool_calls ADD COLUMN {name} {ddl}")
+            changed = True
+    if changed:
+        # _tool_result rows already store the tool_use_id in `target` —
+        # populate the new column from there in one statement.
+        conn.execute(
+            "UPDATE tool_calls SET tool_use_id = target "
+            "WHERE tool_name='_tool_result' AND tool_use_id IS NULL AND target IS NOT NULL"
+        )
+        conn.commit()
+
+
 @contextmanager
 def connect(path: Union[str, Path]):
-    conn = sqlite3.connect(path)
+    if _USING_HELIOSDB and _HELIOSDB_DSN:
+        # Daemon mode: psycopg2 → running heliosdb-nano server.
+        conn = sqlite3.connect(
+            str(path),
+            mode="daemon",
+            dsn=_HELIOSDB_DSN,
+            timeout=30.0,
+        )
+    else:
+        # Embedded mode (HeliosDB) or stdlib sqlite3 — same call signature.
+        conn = sqlite3.connect(str(path), timeout=30.0)
     conn.row_factory = sqlite3.Row
+    # PRAGMAs are advisory under HeliosDB (no-op for journal_mode/synchronous/
+    # busy_timeout; foreign_keys are always on). Sending them anyway keeps
+    # the code uniform across backends.
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
@@ -254,18 +379,286 @@ def project_summary(db_path, since=None, until=None) -> list:
 
 
 def tool_token_breakdown(db_path, since=None, until=None) -> list:
+    """Per-tool stats: call count + total response tokens (from the paired
+    `_tool_result` row, joined on tool_use_id) + is_mcp + tokens_per_call.
+
+    The tool_use and tool_result blocks live in adjacent messages, so the
+    pairing is by tool_use_id (set on both ends by the scanner). Rows from
+    pre-tool_use_id scans get treated as 0 tokens; once the scanner re-reads
+    those JSONLs, the proper pairing fills in.
+    """
     rng, args = _range_clause(since, until)
     sql = f"""
-      SELECT tool_name,
+      WITH calls AS (
+        SELECT tool_name, tool_use_id, message_uuid, target, result_tokens, timestamp
+          FROM tool_calls
+         WHERE tool_name != '_tool_result' {rng}
+      )
+      SELECT c.tool_name,
              COUNT(*) AS calls,
-             COALESCE(SUM(result_tokens),0) AS result_tokens
-        FROM tool_calls
-       WHERE tool_name != '_tool_result' {rng}
-       GROUP BY tool_name
+             COALESCE(SUM(COALESCE(r.result_tokens, c.result_tokens, 0)), 0) AS result_tokens
+        FROM calls c
+        LEFT JOIN tool_calls r
+               ON r.tool_use_id = c.tool_use_id
+              AND r.tool_name = '_tool_result'
+              AND c.tool_use_id IS NOT NULL
+       GROUP BY c.tool_name
        ORDER BY calls DESC
     """
     with connect(db_path) as c:
-        return [dict(r) for r in c.execute(sql, args)]
+        rows = [dict(r) for r in c.execute(sql, args)]
+        for r in rows:
+            r["is_mcp"] = r["tool_name"].startswith("mcp__")
+            r["tokens_per_call"] = (r["result_tokens"] / r["calls"]) if r["calls"] else 0
+        return rows
+
+
+def mcp_summary(db_path, since=None, until=None) -> dict:
+    """Headline MCP metrics: total MCP calls, total observed tokens,
+    total estimated baseline, savings (per-call sum of positives), share of
+    all tool tokens."""
+    rng, args = _range_clause(since, until)
+    with connect(db_path) as c:
+        row = c.execute(f"""
+          SELECT
+            COUNT(*) AS mcp_calls,
+            COALESCE(SUM(COALESCE(r.result_tokens, t.result_tokens, 0)), 0) AS mcp_tokens,
+            COALESCE(SUM(t.baseline_tokens), 0) AS baseline_tokens,
+            COALESCE(SUM(
+              CASE WHEN t.baseline_tokens IS NOT NULL
+                    AND t.baseline_tokens > COALESCE(r.result_tokens, t.result_tokens, 0)
+                   THEN t.baseline_tokens - COALESCE(r.result_tokens, t.result_tokens, 0)
+                   ELSE 0 END
+            ), 0) AS savings_tokens_per_call,
+            SUM(CASE WHEN t.baseline_method='estimated' THEN 1 ELSE 0 END) AS estimated,
+            SUM(CASE WHEN t.baseline_method='measured'  THEN 1 ELSE 0 END) AS measured,
+            SUM(CASE WHEN t.baseline_method='tracking_only' THEN 1 ELSE 0 END) AS tracking_only,
+            SUM(CASE WHEN t.baseline_method IS NULL THEN 1 ELSE 0 END) AS pending,
+            SUM(CASE WHEN t.resolution='exact'      THEN 1 ELSE 0 END) AS exact_res,
+            SUM(CASE WHEN t.resolution='heuristic'  THEN 1 ELSE 0 END) AS heuristic_res,
+            SUM(CASE WHEN t.resolution='unresolved' THEN 1 ELSE 0 END) AS unresolved_res,
+            SUM(CASE WHEN t.followup_within_turn > 0 THEN 1 ELSE 0 END) AS with_followup
+          FROM tool_calls t
+          LEFT JOIN tool_calls r
+                 ON r.tool_use_id = t.tool_use_id
+                AND r.tool_name = '_tool_result'
+                AND t.tool_use_id IS NOT NULL
+          WHERE t.tool_name LIKE 'mcp__%' {rng.replace('timestamp', 't.timestamp')}
+        """, args).fetchone()
+        out = dict(row) if row else {}
+        # Total tokens across all non-result rows in the same range
+        all_t = c.execute(f"""
+          SELECT COALESCE(SUM(COALESCE(r.result_tokens, t.result_tokens, 0)), 0) AS tot
+            FROM tool_calls t
+            LEFT JOIN tool_calls r
+                   ON r.tool_use_id = t.tool_use_id
+                  AND r.tool_name = '_tool_result'
+                  AND t.tool_use_id IS NOT NULL
+           WHERE t.tool_name != '_tool_result' {rng.replace('timestamp', 't.timestamp')}
+        """, args).fetchone()
+        out["all_tool_tokens"] = (all_t["tot"] if all_t else 0) or 0
+        # share of tool tokens that came from MCP
+        if out["all_tool_tokens"]:
+            out["mcp_token_share"] = round((out["mcp_tokens"] or 0) / out["all_tool_tokens"], 4)
+        else:
+            out["mcp_token_share"] = 0.0
+        # Quality score: fraction of LSP-shaped calls that resolved exact
+        total_resolved = (out.get("exact_res") or 0) + (out.get("heuristic_res") or 0) + (out.get("unresolved_res") or 0)
+        out["exact_resolution_rate"] = round((out.get("exact_res") or 0) / total_resolved, 4) if total_resolved else None
+        # Followup-call rate: proxy for "MCP return wasn't enough"
+        out["followup_rate"] = round((out.get("with_followup") or 0) / out["mcp_calls"], 4) if out.get("mcp_calls") else 0.0
+        # Per-call positive-savings sum (avoids cancelling wins against losses).
+        out["savings_tokens"] = out.pop("savings_tokens_per_call", 0) or 0
+        baseline = out.get("baseline_tokens") or 0
+        out["savings_ratio"] = round(out["savings_tokens"] / baseline, 4) if baseline else 0.0
+        return out
+
+
+def mcp_per_tool(db_path, since=None, until=None) -> list:
+    """Per-MCP-tool breakdown with savings columns."""
+    rng, args = _range_clause(since, until)
+    with connect(db_path) as c:
+        sql = f"""
+          SELECT t.tool_name,
+                 COUNT(*) AS calls,
+                 COALESCE(SUM(COALESCE(r.result_tokens, t.result_tokens, 0)), 0) AS result_tokens,
+                 COALESCE(SUM(t.baseline_tokens), 0) AS baseline_tokens,
+                 SUM(CASE WHEN t.baseline_method IS NOT NULL AND t.baseline_method != 'tracking_only' THEN 1 ELSE 0 END) AS baseline_count,
+                 SUM(CASE WHEN t.followup_within_turn > 0 THEN 1 ELSE 0 END) AS followup_calls,
+                 SUM(CASE WHEN t.resolution='exact' THEN 1 ELSE 0 END) AS exact_res,
+                 SUM(CASE WHEN t.resolution IS NOT NULL THEN 1 ELSE 0 END) AS resolved
+            FROM tool_calls t
+            LEFT JOIN tool_calls r
+                   ON r.tool_use_id = t.tool_use_id
+                  AND r.tool_name = '_tool_result'
+                  AND t.tool_use_id IS NOT NULL
+           WHERE t.tool_name LIKE 'mcp__%' {rng.replace('timestamp', 't.timestamp')}
+           GROUP BY t.tool_name
+           ORDER BY calls DESC
+        """
+        rows = [dict(r) for r in c.execute(sql, args)]
+        for row in rows:
+            row["tokens_per_call"] = (row["result_tokens"] / row["calls"]) if row["calls"] else 0
+            row["savings_tokens"] = max(0, (row["baseline_tokens"] or 0) - (row["result_tokens"] or 0))
+            row["savings_ratio"] = (row["savings_tokens"] / row["baseline_tokens"]) if row["baseline_tokens"] else 0
+            row["followup_rate"] = (row["followup_calls"] / row["calls"]) if row["calls"] else 0
+            row["exact_rate"]    = (row["exact_res"] / row["resolved"]) if row["resolved"] else None
+        return rows
+
+
+def mcp_recent_calls(db_path, limit: int = 50) -> list:
+    """Most recent MCP tool calls with savings columns + linked replay."""
+    with connect(db_path) as c:
+        sql = """
+          SELECT t.id, t.tool_name, t.target, t.tool_use_id, t.session_id, t.project_slug,
+                 t.timestamp, COALESCE(r.result_tokens, t.result_tokens) AS result_tokens,
+                 t.baseline_tokens, t.baseline_method,
+                 t.resolution, t.followup_within_turn,
+                 mr.response_tokens AS replay_tokens, mr.replayed_at, mr.took_ms, mr.ok AS replay_ok
+            FROM tool_calls t
+            LEFT JOIN tool_calls r
+                   ON r.tool_use_id = t.tool_use_id
+                  AND r.tool_name = '_tool_result'
+                  AND t.tool_use_id IS NOT NULL
+            LEFT JOIN mcp_replay mr ON mr.call_id = t.id
+           WHERE t.tool_name LIKE 'mcp__%'
+           ORDER BY t.timestamp DESC
+           LIMIT ?
+        """
+        rows = [dict(r) for r in c.execute(sql, (limit,))]
+        for row in rows:
+            if row.get("baseline_tokens") and row.get("result_tokens") is not None:
+                row["savings_tokens"] = max(0, row["baseline_tokens"] - row["result_tokens"])
+            else:
+                row["savings_tokens"] = None
+        return rows
+
+
+def mcp_top_callers(db_path, since=None, until=None, limit: int = 10) -> dict:
+    """Top projects + sessions by MCP call count.
+
+    Token totals come from the paired `_tool_result` row's `result_tokens`,
+    joined on tool_use_id."""
+    rng, args = _range_clause(since, until)
+    rng_t = rng.replace("timestamp", "t.timestamp")
+    with connect(db_path) as c:
+        proj = c.execute(f"""
+          SELECT t.project_slug,
+                 COUNT(*) AS mcp_calls,
+                 COALESCE(SUM(COALESCE(r.result_tokens, t.result_tokens, 0)),0) AS mcp_tokens,
+                 COALESCE(SUM(t.baseline_tokens),0) AS baseline_tokens
+            FROM tool_calls t
+            LEFT JOIN tool_calls r
+                   ON r.tool_use_id = t.tool_use_id
+                  AND r.tool_name = '_tool_result'
+                  AND t.tool_use_id IS NOT NULL
+           WHERE t.tool_name LIKE 'mcp__%' {rng_t}
+           GROUP BY t.project_slug
+           ORDER BY mcp_calls DESC
+           LIMIT ?
+        """, (*args, limit)).fetchall()
+        sess = c.execute(f"""
+          SELECT t.session_id, t.project_slug,
+                 COUNT(*) AS mcp_calls,
+                 COALESCE(SUM(COALESCE(r.result_tokens, t.result_tokens, 0)),0) AS mcp_tokens,
+                 COALESCE(SUM(t.baseline_tokens),0) AS baseline_tokens,
+                 MAX(t.timestamp) AS last_call
+            FROM tool_calls t
+            LEFT JOIN tool_calls r
+                   ON r.tool_use_id = t.tool_use_id
+                  AND r.tool_name = '_tool_result'
+                  AND t.tool_use_id IS NOT NULL
+           WHERE t.tool_name LIKE 'mcp__%' {rng_t}
+           GROUP BY t.session_id
+           ORDER BY mcp_calls DESC
+           LIMIT ?
+        """, (*args, limit)).fetchall()
+        return {
+            "projects": [dict(r) for r in proj],
+            "sessions": [dict(r) for r in sess],
+        }
+
+
+def project_mcp_share(db_path, since=None, until=None) -> dict:
+    """Map project_slug → {mcp_calls, mcp_tokens, baseline_tokens}."""
+    rng, args = _range_clause(since, until)
+    rng_t = rng.replace("timestamp", "t.timestamp")
+    with connect(db_path) as c:
+        rows = c.execute(f"""
+          SELECT t.project_slug,
+                 COUNT(*) AS mcp_calls,
+                 COALESCE(SUM(COALESCE(r.result_tokens, t.result_tokens, 0)),0) AS mcp_tokens,
+                 COALESCE(SUM(t.baseline_tokens),0) AS baseline_tokens
+            FROM tool_calls t
+            LEFT JOIN tool_calls r
+                   ON r.tool_use_id = t.tool_use_id
+                  AND r.tool_name = '_tool_result'
+                  AND t.tool_use_id IS NOT NULL
+           WHERE t.tool_name LIKE 'mcp__%' {rng_t}
+           GROUP BY t.project_slug
+        """, args).fetchall()
+        return {r["project_slug"]: dict(r) for r in rows}
+
+
+def session_mcp_share(db_path, since=None, until=None) -> dict:
+    """Map session_id → {mcp_calls, mcp_tokens, baseline_tokens}."""
+    rng, args = _range_clause(since, until)
+    rng_t = rng.replace("timestamp", "t.timestamp")
+    with connect(db_path) as c:
+        rows = c.execute(f"""
+          SELECT t.session_id,
+                 COUNT(*) AS mcp_calls,
+                 COALESCE(SUM(COALESCE(r.result_tokens, t.result_tokens, 0)),0) AS mcp_tokens,
+                 COALESCE(SUM(t.baseline_tokens),0) AS baseline_tokens
+            FROM tool_calls t
+            LEFT JOIN tool_calls r
+                   ON r.tool_use_id = t.tool_use_id
+                  AND r.tool_name = '_tool_result'
+                  AND t.tool_use_id IS NOT NULL
+           WHERE t.tool_name LIKE 'mcp__%' {rng_t}
+           GROUP BY t.session_id
+        """, args).fetchall()
+        return {r["session_id"]: dict(r) for r in rows}
+
+
+def prompt_mcp_share(db_path, user_uuids: list) -> dict:
+    """Map user_uuid → MCP stats for the assistant turn that follows it.
+
+    Pairs by parent_uuid the same way expensive_prompts does. Token totals
+    come from the paired _tool_result row joined on tool_use_id."""
+    if not user_uuids:
+        return {}
+    placeholders = ",".join("?" * len(user_uuids))
+    with connect(db_path) as c:
+        rows = c.execute(f"""
+          SELECT u.uuid AS user_uuid,
+                 COUNT(t.id) AS mcp_calls,
+                 COALESCE(SUM(COALESCE(r.result_tokens, t.result_tokens, 0)),0) AS mcp_tokens,
+                 COALESCE(SUM(t.baseline_tokens),0) AS baseline_tokens
+            FROM messages u
+            JOIN messages a ON a.parent_uuid = u.uuid AND a.type='assistant'
+            LEFT JOIN tool_calls t ON t.message_uuid = a.uuid
+                                  AND t.tool_name LIKE 'mcp__%'
+            LEFT JOIN tool_calls r
+                   ON r.tool_use_id = t.tool_use_id
+                  AND r.tool_name = '_tool_result'
+                  AND t.tool_use_id IS NOT NULL
+           WHERE u.uuid IN ({placeholders})
+           GROUP BY u.uuid
+        """, user_uuids).fetchall()
+        return {r["user_uuid"]: dict(r) for r in rows}
+
+
+def get_mcp_state(db_path, key: str) -> Optional[str]:
+    with connect(db_path) as c:
+        row = c.execute("SELECT v FROM mcp_state WHERE k=?", (key,)).fetchone()
+        return row["v"] if row else None
+
+
+def set_mcp_state(db_path, key: str, value: str) -> None:
+    with connect(db_path) as c:
+        c.execute("INSERT OR REPLACE INTO mcp_state (k, v) VALUES (?, ?)", (key, value))
+        c.commit()
 
 
 def recent_sessions(db_path, limit: int = 20, since=None, until=None) -> list:

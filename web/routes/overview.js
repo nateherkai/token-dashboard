@@ -116,7 +116,18 @@ export default async function (root) {
     </div>
 
     <div class="row cols-2" style="margin-top:16px">
-      <div class="card"><h3>Top tools (by call count)</h3><div id="ch-tools" style="height:320px"></div></div>
+      <div class="card">
+        <h3 style="display:flex;align-items:center">
+          <span>Top tools</span>
+          <span class="spacer"></span>
+          <span class="range-tabs" id="tools-sort">
+            <button data-key="calls" class="active">by calls</button>
+            <button data-key="tokens_per_call">by tokens/call</button>
+          </span>
+        </h3>
+        <p class="muted" style="margin:-4px 0 8px;font-size:12px">Tools that return more tokens per call cost you more context. MCP-prefixed tools are highlighted.</p>
+        <div id="ch-tools" style="height:320px"></div>
+      </div>
       <div class="card">
         <h3 style="display:flex;align-items:center"><span>Recent sessions</span><span class="spacer"></span><a href="#/sessions" style="font-weight:400;font-size:12px">all →</a></h3>
         <table>
@@ -179,12 +190,24 @@ export default async function (root) {
     ],
   });
 
-  // top tools
-  const topTools = tools.slice(0, 8);
-  barChart(document.getElementById('ch-tools'), {
-    categories: topTools.map(t => t.tool_name),
-    values: topTools.map(t => t.calls),
-    color: '#7C5CFF',
+  // top tools (Layer B — sortable by calls or tokens/call, MCP highlighted)
+  const renderTools = (sortKey) => {
+    const sorted = tools.slice()
+      .filter(t => sortKey !== 'tokens_per_call' || (t.tokens_per_call || 0) > 0)
+      .sort((a, b) => (b[sortKey] || 0) - (a[sortKey] || 0))
+      .slice(0, 10);
+    barChart(document.getElementById('ch-tools'), {
+      categories: sorted.map(t => (t.is_mcp ? '★ ' : '') + (t.tool_name.length > 28 ? t.tool_name.slice(0, 27) + '…' : t.tool_name)),
+      values:     sorted.map(t => sortKey === 'tokens_per_call' ? Math.round(t.tokens_per_call) : t.calls),
+      color: sortKey === 'tokens_per_call' ? '#E8A23B' : '#7C5CFF',
+    });
+  };
+  renderTools('calls');
+  document.querySelectorAll('#tools-sort button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('#tools-sort button').forEach(b => b.classList.toggle('active', b === btn));
+      renderTools(btn.dataset.key);
+    });
   });
 }
 

@@ -205,6 +205,38 @@ body.privacy-on .blur-sensitive { filter: blur(6px); }
 .spacer { flex: 1; }
 hr.divider { border: 0; border-top: 1px solid var(--border); margin: 16px 0; }
 
+/* savings tinting (used by MCP tab + project/session/prompt rollups) */
+.savings-good { color: var(--good); }
+.savings-bad  { color: var(--bad);  }
+
+/* HeliosDB attribution pill */
+.topbar .pill.helios {
+  text-decoration: none;
+  background: linear-gradient(180deg, rgba(124,92,255,0.12), rgba(74,158,255,0.12));
+  color: var(--accent-2);
+  border-color: rgba(124,92,255,0.25);
+  transition: filter 120ms;
+}
+.topbar .pill.helios:hover {
+  text-decoration: none;
+  filter: brightness(1.2);
+}
+
+/* mini button used inline in tables */
+button.mini {
+  padding: 2px 6px; font-size: 11px; border-radius: 4px;
+  background: var(--panel-2); color: var(--muted);
+  border: 1px solid var(--border);
+  font-family: var(--mono);
+}
+button.mini:hover { color: var(--text); border-color: var(--border-2); }
+button[disabled] { opacity: 0.5; cursor: not-allowed; }
+
+code {
+  background: var(--panel-2); padding: 1px 5px; border-radius: 3px;
+  font-family: var(--mono); font-size: 12px;
+}
+
 /* glossary */
 .glossary summary {
   cursor: pointer;

@@ -43,7 +43,7 @@ export default async function (root) {
 
   $('#save').addEventListener('click', async () => {
     const plan = $('#plan').value;
-    await fetch('/api/plan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ plan }) });
+    await api('/api/plan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ plan }) });
     state.plan = plan;
     document.getElementById('plan-pill').textContent = plan;
     $('#msg').textContent = 'Saved.';

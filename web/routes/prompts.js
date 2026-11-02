@@ -38,7 +38,7 @@ export default async function (root) {
     </div>
 
     <div class="card">
-      <p class="muted" style="margin:0 0 14px">${subtitle}</p>
+      <p class="muted" style="margin:0 0 14px">${subtitle} <b>MCP</b> shows tool calls routed via MCP servers; <b>est. saved</b> is the rule-based estimate vs a Read/Grep recipe.</p>
       <table id="prompts">
         <thead><tr>
           <th>${sort.key === 'recent' ? 'when' : 'cache cost'}</th>
@@ -46,6 +46,8 @@ export default async function (root) {
           <th>model</th>
           <th class="num">tokens</th>
           <th class="num">cache rd</th>
+          <th class="num">MCP</th>
+          <th class="num">est. saved</th>
           <th>session</th>
         </tr></thead>
         <tbody>
@@ -56,8 +58,10 @@ export default async function (root) {
               <td><span class="badge ${fmt.modelClass(r.model)}">${fmt.htmlSafe(fmt.modelShort(r.model))}</span></td>
               <td class="num">${fmt.int(r.billable_tokens)}</td>
               <td class="num">${fmt.int(r.cache_read_tokens)}</td>
-              <td><a href="#/sessions/${encodeURIComponent(r.session_id)}" class="mono" onclick="event.stopPropagation()">${fmt.htmlSafe(r.session_id.slice(0,8))}…</a></td>
-            </tr>`).join('') || '<tr><td colspan="6" class="muted">no prompts yet</td></tr>'}
+              <td class="num ${r.mcp_calls ? '' : 'muted'}">${r.mcp_calls ? fmt.int(r.mcp_calls) : '—'}</td>
+              <td class="num ${r.savings_tokens ? 'savings-good' : 'muted'}">${r.savings_tokens ? fmt.compact(r.savings_tokens) : '—'}</td>
+              <td><a href="#/sessions/${encodeURIComponent(r.session_id)}" class="mono">${fmt.htmlSafe(r.session_id.slice(0,8))}…</a></td>
+            </tr>`).join('') || '<tr><td colspan="8" class="muted">no prompts yet</td></tr>'}
         </tbody>
       </table>
     </div>
@@ -69,15 +73,22 @@ export default async function (root) {
   });
 
   root.querySelectorAll('#prompts tbody tr').forEach(tr => {
+    tr.querySelectorAll('a').forEach(link => {
+      link.addEventListener('click', event => event.stopPropagation());
+    });
     tr.addEventListener('click', () => {
       const r = rows[Number(tr.dataset.i)];
       const drawer = document.getElementById('drawer');
+      const mcpLine = r.mcp_calls
+        ? `<span style="color:#3FB68B">${fmt.int(r.mcp_calls)} MCP calls · ${fmt.int(r.mcp_tokens)} returned · est. baseline ${fmt.int(r.baseline_tokens)} → saved ${fmt.int(r.savings_tokens)}</span>`
+        : '<span class="muted">no MCP calls in this turn</span>';
       drawer.innerHTML = `
         <div class="card">
           <h3 style="display:flex;align-items:center">
             <span>Prompt detail</span>
             <span class="spacer"></span>
             <span class="badge ${fmt.modelClass(r.model)}">${fmt.htmlSafe(fmt.modelShort(r.model))}</span>
+            <button class="mini" id="explain-btn" data-uuid="${fmt.htmlSafe(r.user_uuid)}" style="margin-left:8px">explain (RAG)</button>
           </h3>
           <pre class="blur-sensitive">${fmt.htmlSafe(r.prompt_text || '')}</pre>
           <div class="flex" style="margin-top:12px;flex-wrap:wrap;gap:14px">
@@ -86,7 +97,30 @@ export default async function (root) {
             <span class="spacer"></span>
             <a href="#/sessions/${encodeURIComponent(r.session_id)}">Open session →</a>
           </div>
+          <div style="margin-top:8px;font-size:12px">${mcpLine}</div>
+          <div id="explain-panel" style="margin-top:12px"></div>
         </div>`;
+      // Wire RAG-explain
+      const eb = document.getElementById('explain-btn');
+      if (eb) eb.addEventListener('click', async () => {
+        eb.disabled = true; eb.textContent = '…';
+        const panel = document.getElementById('explain-panel');
+        panel.innerHTML = '<p class="muted">retrieving similar prompts and tool calls…</p>';
+        try {
+          const ex = await api('/api/explain?uuid=' + encodeURIComponent(eb.dataset.uuid) + '&neighbours=5');
+          if (ex.error) { panel.innerHTML = `<p class="muted">${fmt.htmlSafe(ex.error)}</p>`; return; }
+          const tool_summary = (ex.tool_calls || []).map(t => `${t.tool_name}${t.target ? ' → ' + fmt.short(t.target,50) : ''}`).join(' · ') || '—';
+          const sim = (ex.similar_prompts || []).map(p => `
+            <div style="font-size:12px;padding:4px 0;border-bottom:1px solid var(--border)">
+              <span class="muted mono">${fmt.ts(p.timestamp)} · dist ${(p.distance).toFixed(3)}</span>
+              <a href="#/sessions/${encodeURIComponent(p.session_id)}" style="margin-left:6px">${fmt.htmlSafe(fmt.short(p.preview, 140))}</a>
+            </div>`).join('') || '<p class="muted">no similar prompts found</p>';
+          panel.innerHTML = `
+            <div style="font-size:12px"><b>${ex.tool_calls.length}</b> tool calls in this turn · ${fmt.htmlSafe(tool_summary)}</div>
+            <h4 style="margin:10px 0 4px;font-size:12px">Similar prompts (semantic)</h4>${sim}
+          `;
+        } catch (e) { panel.innerHTML = `<p class="savings-bad">${fmt.htmlSafe(String(e))}</p>`; }
+      });
       drawer.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     });
   });
