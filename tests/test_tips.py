@@ -3,6 +3,7 @@ import tempfile
 import unittest
 
 from token_dashboard.db import init_db, connect
+from token_dashboard.pricing import PRICING_JSON, cost_for, load_pricing
 from token_dashboard.tips import (
     cache_discipline_tips, repeated_target_tips, right_size_tips,
     outlier_tips, all_tips, dismiss_tip,
@@ -69,6 +70,18 @@ class RightSizeTests(unittest.TestCase):
             c.commit()
         tips = right_size_tips(self.db, today_iso="2026-04-19T00:00:00")
         self.assertTrue(any(t["category"] == "right-size" for t in tips))
+
+    def test_right_size_costs_come_from_pricing_json(self):
+        with connect(self.db) as c:
+            for i in range(10):
+                c.execute("INSERT INTO messages (uuid, session_id, project_slug, type, timestamp, model, input_tokens, output_tokens, cache_read_tokens, cache_create_5m_tokens, cache_create_1h_tokens, is_sidechain) VALUES (?, 's','p','assistant','2026-04-18T00:00:00Z','claude-opus-4-7', 1000000, 200, 1000000, 0, 0, 0)", (f"a{i}",))
+            c.commit()
+        pricing = load_pricing(PRICING_JSON)
+        usage = {"input_tokens": 10_000_000, "output_tokens": 2000, "cache_read_tokens": 10_000_000,
+                 "cache_create_5m_tokens": 0, "cache_create_1h_tokens": 0}
+        opus = cost_for("claude-opus-4-7", usage, pricing)["usd"]
+        tip = right_size_tips(self.db, today_iso="2026-04-19T00:00:00")[0]
+        self.assertIn(f"~${opus:.2f}", tip["body"])
 
 
 class OutlierTests(unittest.TestCase):

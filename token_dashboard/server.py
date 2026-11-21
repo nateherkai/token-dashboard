@@ -15,14 +15,13 @@ from .db import (
     tool_token_breakdown, recent_sessions, session_turns,
     daily_token_breakdown, model_breakdown, skill_breakdown,
 )
-from .pricing import load_pricing, cost_for, get_plan, set_plan
+from .pricing import PRICING_JSON, load_pricing, cost_for, get_plan, set_plan
 from .tips import all_tips, dismiss_tip
 from .scanner import scan_dir
 from .skills import cached_catalog
 
 
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
-PRICING_JSON = Path(__file__).resolve().parent.parent / "pricing.json"
 
 EVENTS: "queue.Queue[dict]" = queue.Queue()
 
