@@ -21,6 +21,15 @@ class InitDbTests(unittest.TestCase):
         init_db(self.db_path)
         init_db(self.db_path)
 
+    def test_tool_calls_delete_by_message_uuid_uses_index(self):
+        # The scanner runs this delete once per message; a full table scan
+        # here makes the first scan of a large history quadratic.
+        init_db(self.db_path)
+        with sqlite3.connect(self.db_path) as c:
+            plan = " ".join(r[3] for r in c.execute(
+                "EXPLAIN QUERY PLAN DELETE FROM tool_calls WHERE message_uuid=?", ("x",)))
+        self.assertIn("idx_tools_message", plan)
+
     def test_connect_returns_row_factory(self):
         init_db(self.db_path)
         with connect(self.db_path) as c:
