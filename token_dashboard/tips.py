@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 
 from .db import connect
+from .pricing import PRICING_JSON, cost_for, load_pricing
 
 
 def _iso_days_ago(today_iso: str, n: int) -> str:
@@ -109,20 +110,29 @@ def right_size_tips(db_path, today_iso: Optional[str] = None) -> List[dict]:
     today_iso = today_iso or datetime.utcnow().isoformat()
     since = _iso_days_ago(today_iso, 7)
     sql = """
-      SELECT COUNT(*) AS n,
-             SUM(input_tokens+cache_create_5m_tokens+cache_create_1h_tokens) AS in_tok,
-             SUM(output_tokens) AS out_tok
+      SELECT model, COUNT(*) AS n,
+             SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
+             SUM(cache_read_tokens) AS cache_read_tokens,
+             SUM(cache_create_5m_tokens) AS cache_create_5m_tokens,
+             SUM(cache_create_1h_tokens) AS cache_create_1h_tokens
         FROM messages
        WHERE type='assistant' AND model LIKE '%opus%'
          AND output_tokens < 500 AND is_sidechain = 0
          AND timestamp >= ?
+       GROUP BY model
     """
     with connect(db_path) as c:
-        row = c.execute(sql, (since,)).fetchone()
-    if not row or (row["n"] or 0) < 10:
+        rows = c.execute(sql, (since,)).fetchall()
+    n = sum(r["n"] for r in rows)
+    if n < 10:
         return []
-    api_opus   = ((row["in_tok"] or 0) * 15 + (row["out_tok"] or 0) * 75) / 1_000_000
-    api_sonnet = ((row["in_tok"] or 0) *  3 + (row["out_tok"] or 0) * 15) / 1_000_000
+    pricing = load_pricing(PRICING_JSON)
+    api_opus = api_sonnet = 0.0
+    for r in rows:
+        usage = {k: r[k] or 0 for k in r.keys() if k.endswith("_tokens")}
+        api_opus += cost_for(r["model"], usage, pricing)["usd"] or 0
+        # Same-generation Sonnet when the file lists it, else the sonnet tier fallback.
+        api_sonnet += cost_for(r["model"].replace("opus", "sonnet"), usage, pricing)["usd"] or 0
     savings = api_opus - api_sonnet
     if savings < 1.0:
         return []
@@ -131,7 +141,7 @@ def right_size_tips(db_path, today_iso: Optional[str] = None) -> List[dict]:
         return []
     return [{
         "key": key, "category": "right-size",
-        "title": f"{row['n']} short Opus turns might fit on Sonnet",
+        "title": f"{n} short Opus turns might fit on Sonnet",
         "body": f"Opus turns under 500 output tokens cost ~${api_opus:.2f} in the last 7 days. Sonnet would have cost ~${api_sonnet:.2f} (savings ~${savings:.2f}).",
         "scope": "opus-short-turns-7d",
     }]
